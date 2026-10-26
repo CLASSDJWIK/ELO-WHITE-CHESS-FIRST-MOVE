@@ -1,0 +1,416 @@
+---
+title: "The Elo Method in Chess"
+subtitle: "Advanced Data Science — Data Challenge"
+author: "Name Surname"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: false
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = TRUE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 4.5,
+  dpi = 130
+)
+options(scipen = 6)
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  stop("Install ggplot2 before knitting: install.packages('ggplot2')")
+}
+library(ggplot2)
+theme_set(theme_minimal(base_size = 12))
+```
+
+## Introduction
+
+The Elo system updates a player's rating by comparing the result of a game with the result expected from the two players' current ratings. An expected result produces no change; doing better or worse than expected leads to a gain or loss.
+
+We use the outcomes of chess games to examine six questions: whether White scores more than Black, how cumulative points behave, why Elo updates sum to zero, what the resulting Elo distribution looks like, how the two rankings compare, and whether the number of games played is associated with either rating.
+
+Each row of the dataset records the identifiers of the White and Black players and the result from White's point of view. `Score = 1` means that White won, `Score = 0.5` a draw, and `Score = 0` a Black win. Player numbers are identifiers, not measurements.
+
+## Data and preparation
+
+Place `data.csv` in the same folder as this R Markdown file. The order of the rows is preserved: it matters for the sequential Elo calculation in Question 4.
+
+```{r load-data}
+chess_data <- read.csv("data.csv", stringsAsFactors = FALSE)
+
+required_columns <- c("White", "Black", "Score")
+if (!all(required_columns %in% names(chess_data))) {
+  stop("data.csv must contain the columns White, Black and Score.")
+}
+
+chess_data <- chess_data[, required_columns]
+chess_data$White <- as.character(chess_data$White)
+chess_data$Black <- as.character(chess_data$Black)
+chess_data$Score <- as.numeric(chess_data$Score)
+
+if (anyNA(chess_data) ||
+    any(!chess_data$Score %in% c(0, 0.5, 1)) ||
+    any(chess_data$White == chess_data$Black) ||
+    any(chess_data$White == "" | chess_data$Black == "")) {
+  stop("The dataset contains missing or invalid game records.")
+}
+
+n_games <- nrow(chess_data)
+player_ids <- sort(unique(c(chess_data$White, chess_data$Black)))
+n_players <- length(player_ids)
+
+knitr::kable(
+  data.frame(
+    Measure = c("Games", "Players", "Missing values"),
+    Value = c(n_games, n_players, sum(is.na(chess_data)))
+  ),
+  caption = "Dataset overview"
+)
+knitr::kable(head(chess_data), caption = "First six game records")
+```
+
+The file contains **`r format(n_games, big.mark = ",")` games** played by **`r format(n_players, big.mark = ",")` distinct players**. The following calculations use only the results available in this file; player strength and how the colors were assigned are not provided.
+
+## 1. Does White have a first-mover advantage?
+
+We first count wins and draws. The average White score includes half a point for a draw:
+
+\[
+\overline{s}_W = \frac{N_{W\mathrm{\ wins}} + 0.5N_{\mathrm{draws}}}{N_{\mathrm{games}}}.
+\]
+
+A score of 0.5 is the neutral reference: across games, White and Black would then receive the same total number of points.
+
+```{r white-advantage}
+white_wins <- sum(chess_data$Score == 1)
+draws <- sum(chess_data$Score == 0.5)
+black_wins <- sum(chess_data$Score == 0)
+white_mean <- mean(chess_data$Score)
+white_decisive_share <- white_wins / (white_wins + black_wins)
+
+white_summary <- data.frame(
+  Measure = c(
+    "White wins", "Draws", "Black wins",
+    "Average White score", "White share of decisive games"
+  ),
+  Value = c(
+    sprintf("%d (%.2f%%)", white_wins, 100 * white_wins / n_games),
+    sprintf("%d (%.2f%%)", draws, 100 * draws / n_games),
+    sprintf("%d (%.2f%%)", black_wins, 100 * black_wins / n_games),
+    sprintf("%.5f", white_mean),
+    sprintf("%.2f%%", 100 * white_decisive_share)
+  )
+)
+knitr::kable(white_summary, caption = "Game outcomes and White's average score")
+
+outcomes <- data.frame(
+  Outcome = factor(c("White win", "Draw", "Black win"),
+                   levels = c("White win", "Draw", "Black win")),
+  Games = c(white_wins, draws, black_wins)
+)
+
+ggplot(outcomes, aes(x = Outcome, y = Games, fill = Outcome)) +
+  geom_col(width = 0.62, show.legend = FALSE) +
+  scale_fill_manual(values = c("#356fa3", "#98a5b4", "#cc8c55")) +
+  labs(title = "Outcomes of the chess games", x = NULL, y = "Number of games")
+```
+
+White scores an average of **`r sprintf("%.5f", white_mean)`**, `r if (white_mean > 0.5) "above" else if (white_mean < 0.5) "below" else "equal to"` the neutral value of 0.5. White wins **`r sprintf("%.2f", 100 * white_wins / n_games)`%** of all games, against **`r sprintf("%.2f", 100 * black_wins / n_games)`%** for Black. When draws are excluded, White accounts for **`r sprintf("%.2f", 100 * white_decisive_share)`%** of decisive results.
+
+This gives `r if (white_mean > 0.5) "descriptive evidence of an advantage for White" else if (white_mean < 0.5) "descriptive evidence of an advantage for Black" else "no average scoring advantage to either color"` in these recorded games. It does not by itself establish that moving first causes the difference: several games can involve the same players, and the dataset does not tell us whether colors were assigned at random.
+
+## 2. Compute the point ratings. How are they distributed?
+
+A player's *point rating* is simply the sum of points earned across all games: 1 for a win, 0.5 for a draw and 0 for a loss. For each record, White receives `Score` and Black receives `1 - Score`.
+
+```{r point-rating-function}
+compute_points <- function(data) {
+  ids <- sort(unique(c(data$White, data$Black)))
+  white_index <- match(data$White, ids)
+  black_index <- match(data$Black, ids)
+
+  # One entry per participation, with the corresponding score.
+  player_index <- c(white_index, black_index)
+  points_earned <- c(data$Score, 1 - data$Score)
+
+  # Count participations and sum the points for each player.
+  games_played <- tabulate(player_index, nbins = length(ids))
+  points <- as.numeric(tapply(
+    points_earned,
+    factor(player_index, levels = seq_along(ids)),
+    sum
+  ))
+
+  data.frame(
+    Player = ids,
+    Total_Points = points,
+    Total_Games = games_played,
+    Points_Per_Game = points / games_played
+  )
+}
+
+player_points <- compute_points(chess_data)
+stopifnot(abs(sum(player_points$Total_Points) - n_games) < 1e-8)
+
+point_summary <- data.frame(
+  Statistic = c("Minimum", "Median", "Mean", "Maximum", "Sum of player points"),
+  Value = c(
+    min(player_points$Total_Points),
+    median(player_points$Total_Points),
+    mean(player_points$Total_Points),
+    max(player_points$Total_Points),
+    sum(player_points$Total_Points)
+  )
+)
+knitr::kable(point_summary, digits = 2, caption = "Summary of cumulative point ratings")
+```
+
+```{r point-rating-figures, fig.height=4.2}
+ggplot(player_points, aes(x = Total_Points)) +
+  geom_histogram(bins = 40, fill = "#356fa3", color = "white") +
+  labs(title = "Cumulative points per player", x = "Total points", y = "Players")
+
+ggplot(player_points, aes(x = log1p(Total_Points))) +
+  geom_histogram(bins = 40, fill = "#547f8d", color = "white") +
+  labs(title = "The same points on a log(1 + points) scale",
+       x = "log(1 + points)", y = "Players")
+```
+
+Most players accumulate relatively few points, while a smaller group has much higher totals. The median is **`r format(median(player_points$Total_Points), trim = TRUE)` points**, compared with a maximum of **`r format(max(player_points$Total_Points), trim = TRUE)`**. The histogram therefore has a long right tail.
+
+Part of the explanation is how this rating is constructed: points accumulate each time a player takes part in a game. A player who competes often has more opportunities to collect points, even if their average score per game is not especially high. The second histogram uses `log(1 + points)` to make the lower end easier to examine; it does not change anyone's rating.
+
+There is also a useful check on the calculation. **The total of all player points is `r format(sum(player_points$Total_Points), big.mark = ",")`, exactly the number of games.** In every game, the two players receive one point between them, including when the result is a draw.
+
+## 3. Why is the sum of Elo ratings always zero?
+
+Assume that every player starts with Elo rating 0. Let \(r_i\) and \(r_j\) be the ratings of two players before their game. Their expected scores under the Elo model are
+
+\[
+\mu_{ij} = \frac{1}{1 + 10^{(r_j-r_i)/\zeta}},
+\qquad
+\mu_{ji} = \frac{1}{1 + 10^{(r_i-r_j)/\zeta}}.
+\]
+
+These expected scores add to one: \(\mu_{ij}+\mu_{ji}=1\). Actual scores are also complementary, whether the game ends in a win or a draw: \(s_{ij}+s_{ji}=1\).
+
+For update factor \(\kappa\), the changes are
+
+\[
+\Delta r_i = \kappa(s_{ij}-\mu_{ij}),
+\qquad
+\Delta r_j = \kappa(s_{ji}-\mu_{ji}).
+\]
+
+Adding the two changes gives
+
+\[
+\begin{aligned}
+\Delta r_i + \Delta r_j
+ &= \kappa\big[(s_{ij}+s_{ji})-(\mu_{ij}+\mu_{ji})\big] \\
+ &= \kappa(1-1) = 0.
+\end{aligned}
+\]
+
+Thus, every rating gain is balanced by an equal loss in the same game. Since the total starts at zero and never changes,
+
+\[
+\boxed{\sum_{i=1}^{N} r_i^{(t)}=0\quad \text{after every game }t.}
+\]
+
+This is the *zero-sum property*. It refers to the **sum of all Elo ratings**, not to the number of players with positive or negative ratings. In a computer calculation, the result may differ from exactly zero by a very small amount because of floating-point rounding.
+
+## 4. Compute the Elo ratings and verify the property
+
+We set \(\zeta=400\) and \(\kappa=25\), as requested. Initially, all ratings are zero. Each game is processed in the order in which it appears in the CSV.
+
+Only one update value is needed per game. The change calculated for White is added to White's rating and subtracted from Black's rating, as shown in Question 3.
+
+```{r elo-rating-function}
+compute_elo <- function(data, zeta = 400, kappa = 25) {
+  ids <- sort(unique(c(data$White, data$Black)))
+  white_index <- match(data$White, ids)
+  black_index <- match(data$Black, ids)
+  rating <- numeric(length(ids))
+
+  for (game in seq_len(nrow(data))) {
+    w <- white_index[game]
+    b <- black_index[game]
+
+    expected_white <- 1 / (1 + 10^((rating[b] - rating[w]) / zeta))
+    change <- kappa * (data$Score[game] - expected_white)
+
+    rating[w] <- rating[w] + change
+    rating[b] <- rating[b] - change
+  }
+
+  data.frame(Player = ids, Elo = rating)
+}
+
+player_elo <- compute_elo(chess_data, zeta = 400, kappa = 25)
+elo_sum <- sum(player_elo$Elo)
+zero_sum_verified <- abs(elo_sum) < 1e-8
+stopifnot(zero_sum_verified)
+
+elo_summary <- data.frame(
+  Statistic = c("Minimum", "Median", "Mean", "Maximum", "Total", "Zero-sum check"),
+  Value = c(
+    sprintf("%.3f", min(player_elo$Elo)),
+    sprintf("%.3f", median(player_elo$Elo)),
+    sprintf("%.3f", mean(player_elo$Elo)),
+    sprintf("%.3f", max(player_elo$Elo)),
+    format(elo_sum, scientific = TRUE, digits = 3),
+    if (zero_sum_verified) "Passed (tolerance 1e-8)" else "Failed"
+  )
+)
+knitr::kable(elo_summary, caption = "Elo rating summary and numerical verification")
+```
+
+```{r elo-distribution}
+ggplot(player_elo, aes(x = Elo)) +
+  geom_histogram(bins = 40, fill = "#368b78", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "#b75f3c") +
+  labs(title = "Distribution of Elo ratings", x = "Elo rating", y = "Players")
+```
+
+Unlike cumulative points, Elo ratings can be negative as well as positive. A win is worth more when it is unexpected, and a defeat can cause a loss in rating even though the player's cumulative points never decrease. An Elo rating therefore reflects results relative to the model's expectations, not simply the volume of points earned.
+
+The calculated sum is **`r format(elo_sum, scientific = TRUE, digits = 3)`**, effectively zero within numerical precision. A zero mean does **not** imply a symmetric or normal distribution; its shape has to be read from the histogram.
+
+There is one limitation to keep in mind: **Elo updates depend on game order**. We use the row order supplied in `data.csv`, but the file contains no dates. We should not assume these ratings reconstruct the players' historical Elo ratings.
+
+## 5. Are point and Elo ratings correlated? Do the top players overlap?
+
+Here we compare both scores for the same players. Pearson's correlation describes linear association; Spearman's correlation compares the rankings and is less sensitive to the sizes of extreme scores.
+
+```{r rating-comparison}
+player_table <- player_points
+player_table$Elo <- player_elo$Elo[
+  match(player_table$Player, player_elo$Player)
+]
+stopifnot(!anyNA(player_table$Elo))
+
+point_elo_pearson <- cor(player_table$Total_Points, player_table$Elo,
+                         method = "pearson")
+point_elo_spearman <- cor(player_table$Total_Points, player_table$Elo,
+                          method = "spearman")
+
+correlation_summary <- data.frame(
+  Measure = c("Pearson", "Spearman"),
+  Correlation = c(point_elo_pearson, point_elo_spearman)
+)
+knitr::kable(correlation_summary, digits = 3,
+             caption = "Relationship between cumulative points and Elo")
+
+# Break ties in cumulative points consistently by player ID.
+top_n <- 20L
+top_by_points <- head(player_table[
+  order(-player_table$Total_Points, player_table$Player),
+], top_n)
+top_by_elo <- head(player_table[
+  order(-player_table$Elo, player_table$Player),
+], top_n)
+shared_players <- intersect(top_by_points$Player, top_by_elo$Player)
+
+knitr::kable(
+  head(top_by_points[, c("Player", "Total_Points", "Elo", "Total_Games")], 10),
+  digits = 2, caption = "Top 10 players by accumulated points"
+)
+knitr::kable(
+  head(top_by_elo[, c("Player", "Elo", "Total_Points", "Total_Games")], 10),
+  digits = 2, caption = "Top 10 players by Elo"
+)
+
+knitr::kable(
+  data.frame(
+    Comparison = "Players present in both top-20 lists",
+    Count = length(shared_players)
+  ),
+  caption = "Overlap between the two rankings"
+)
+```
+
+```{r point-elo-scatter}
+ggplot(player_table, aes(x = Total_Points, y = Elo)) +
+  geom_point(alpha = 0.28, size = 1.2, color = "#356fa3") +
+  geom_smooth(method = "lm", se = FALSE, color = "#b75f3c") +
+  labs(title = "Cumulative points and Elo",
+       x = "Total points", y = "Elo rating")
+```
+
+Pearson's correlation is **`r sprintf("%.3f", point_elo_pearson)`** and Spearman's is **`r sprintf("%.3f", point_elo_spearman)`**. These ratings are related, but they do not sort players in the same way. Only **`r length(shared_players)` of the top `r top_n` players** by points also appear in the top `r top_n` by Elo.
+
+A player can rank highly on total points by playing many games. Elo instead depends on the expected result against each opponent. This explains why the leaders of the two lists need not be identical.
+
+## 6. Is the number of games played associated with the ratings?
+
+We compare the number of games with cumulative points and with Elo. This is an observational analysis of *association*: the dataset does not allow us to isolate a causal effect of playing more games.
+
+```{r activity-summary}
+games_points_pearson <- cor(player_table$Total_Games, player_table$Total_Points,
+                            method = "pearson")
+games_points_spearman <- cor(player_table$Total_Games, player_table$Total_Points,
+                             method = "spearman")
+games_elo_pearson <- cor(player_table$Total_Games, player_table$Elo,
+                         method = "pearson")
+games_elo_spearman <- cor(player_table$Total_Games, player_table$Elo,
+                          method = "spearman")
+
+association_table <- data.frame(
+  Rating = c("Cumulative points", "Elo"),
+  Pearson = c(games_points_pearson, games_elo_pearson),
+  Spearman = c(games_points_spearman, games_elo_spearman)
+)
+knitr::kable(association_table, digits = 3,
+             caption = "Correlations with the number of games played")
+
+point_model <- lm(Total_Points ~ Total_Games, data = player_table)
+elo_model <- lm(Elo ~ Total_Games, data = player_table)
+
+knitr::kable(
+  data.frame(
+    Rating = c("Cumulative points", "Elo"),
+    Slope_Per_Game = c(coef(point_model)[2], coef(elo_model)[2]),
+    R_Squared = c(summary(point_model)$r.squared,
+                  summary(elo_model)$r.squared)
+  ),
+  digits = 3,
+  caption = "Descriptive linear fits (not causal estimates)"
+)
+```
+
+```{r games-points-plot}
+ggplot(player_table, aes(x = Total_Games, y = Total_Points)) +
+  geom_point(alpha = 0.28, size = 1.1, color = "#356fa3") +
+  geom_smooth(method = "lm", se = FALSE, color = "#b75f3c") +
+  labs(title = "Games played and cumulative points",
+       x = "Games played", y = "Total points")
+```
+
+```{r games-elo-plot}
+ggplot(player_table, aes(x = Total_Games, y = Elo)) +
+  geom_point(alpha = 0.28, size = 1.1, color = "#368b78") +
+  geom_smooth(method = "lm", se = FALSE, color = "#b75f3c") +
+  labs(title = "Games played and Elo rating",
+       x = "Games played", y = "Elo rating")
+```
+
+The link between participation and cumulative points is very strong: Pearson's correlation is **`r sprintf("%.3f", games_points_pearson)`** and Spearman's is **`r sprintf("%.3f", games_points_spearman)`**. This is unsurprising because each game creates another opportunity to earn points.
+
+For Elo, the correlations are **`r sprintf("%.3f", games_elo_pearson)`** (Pearson) and **`r sprintf("%.3f", games_elo_spearman)`** (Spearman). These numbers should not be interpreted as evidence that Elo is independent of activity. Players who take part in many games may differ in strength from occasional players, and more games also create more opportunities for the rating to move away from its starting value.
+
+## Conclusion
+
+The results suggest that White has an advantage in this dataset. Point ratings depend strongly on the number of games played, while Elo considers both the result and the opponent's rating. The zero-sum property is also confirmed.
+
+Point and Elo ratings are moderately related, but they do not identify the same top players. Overall, the findings show how the choice of rating method affects player rankings. However, the available data are not enough to explain the cause of White's advantage or fully assess player skill.
